@@ -266,6 +266,164 @@
 (define-constant ERR-ROUND-CLOSED (err u108))
 (define-constant ERR-INSUFFICIENT-FUNDS (err u109))
 (define-constant ERR-ROUND-ACTIVE (err u110))
+(define-constant ERR-PROPOSAL-NOT-FOUND (err u111))
+(define-constant ERR-PROPOSAL-CLOSED (err u112))
+(define-constant ERR-ALREADY-VOTED (err u113))
+(define-constant ERR-PROPOSAL-ACTIVE (err u114))
+
+(define-data-var proposal-id-nonce uint u0)
+(define-data-var proposal-voting-period uint u1008)
+
+(define-map Proposals
+    { proposal-id: uint }
+    {
+        proposer: principal,
+        proposal-type: (string-ascii 20),
+        target-id: uint,
+        description: (string-ascii 300),
+        voting-deadline: uint,
+        votes-for: uint,
+        votes-against: uint,
+        total-voting-power: uint,
+        is-executed: bool,
+        is-active: bool
+    }
+)
+
+(define-map ProposalVotes
+    { proposal-id: uint, voter: principal }
+    {
+        vote: bool,
+        voting-power: uint,
+        vote-timestamp: uint
+    }
+)
+
+(define-public (create-proposal 
+    (proposal-type (string-ascii 20)) 
+    (target-id uint) 
+    (description (string-ascii 300)))
+    (let ((mentor-data (unwrap! (get-mentor tx-sender) ERR-NOT-AUTHORIZED))
+          (proposal-id (var-get proposal-id-nonce))
+          (deadline (+ stacks-block-height (var-get proposal-voting-period))))
+        (asserts! (>= (get token-balance mentor-data) (var-get min-voting-power)) ERR-NOT-AUTHORIZED)
+        (map-set Proposals
+            { proposal-id: proposal-id }
+            {
+                proposer: tx-sender,
+                proposal-type: proposal-type,
+                target-id: target-id,
+                description: description,
+                voting-deadline: deadline,
+                votes-for: u0,
+                votes-against: u0,
+                total-voting-power: u0,
+                is-executed: false,
+                is-active: true
+            }
+        )
+        (var-set proposal-id-nonce (+ proposal-id u1))
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (mentor-data (unwrap! (get-mentor tx-sender) ERR-NOT-AUTHORIZED))
+          (existing-vote (map-get? ProposalVotes { proposal-id: proposal-id, voter: tx-sender }))
+          (voting-power (get token-balance mentor-data)))
+        (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+        (asserts! (get is-active proposal) ERR-PROPOSAL-CLOSED)
+        (asserts! (< stacks-block-height (get voting-deadline proposal)) ERR-PROPOSAL-CLOSED)
+        (asserts! (>= voting-power (var-get min-voting-power)) ERR-NOT-AUTHORIZED)
+        (map-set ProposalVotes
+            { proposal-id: proposal-id, voter: tx-sender }
+            {
+                vote: vote,
+                voting-power: voting-power,
+                vote-timestamp: stacks-block-height
+            }
+        )
+        (map-set Proposals
+            { proposal-id: proposal-id }
+            (merge proposal {
+                votes-for: (if vote (+ (get votes-for proposal) voting-power) (get votes-for proposal)),
+                votes-against: (if vote (get votes-against proposal) (+ (get votes-against proposal) voting-power)),
+                total-voting-power: (+ (get total-voting-power proposal) voting-power)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (asserts! (get is-active proposal) ERR-PROPOSAL-CLOSED)
+        (asserts! (>= stacks-block-height (get voting-deadline proposal)) ERR-PROPOSAL-ACTIVE)
+        (asserts! (not (get is-executed proposal)) ERR-PROPOSAL-CLOSED)
+        (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR-NOT-AUTHORIZED)
+        (map-set Proposals
+            { proposal-id: proposal-id }
+            (merge proposal { is-executed: true, is-active: false })
+        )
+        (if (is-eq (get proposal-type proposal) "approve-startup")
+            (approve-startup-via-proposal (get target-id proposal))
+            (if (is-eq (get proposal-type proposal) "complete-milestone")
+                (complete-milestone-via-proposal (get target-id proposal))
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (approve-startup-via-proposal (startup-id uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND)))
+        (map-set Startups
+            { id: startup-id }
+            (merge startup { status: "approved" })
+        )
+        (ok true)
+    )
+)
+
+(define-private (complete-milestone-via-proposal (milestone-info uint))
+    (let ((startup-id (/ milestone-info u1000))
+          (milestone-id (mod milestone-info u1000)))
+        (enhanced-complete-milestone startup-id milestone-id)
+    )
+)
+
+(define-public (close-proposal (proposal-id uint))
+    (let ((proposal (unwrap! (get-proposal proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+        (asserts! (or (is-eq tx-sender (get proposer proposal)) 
+                     (is-eq tx-sender (var-get dao-owner))) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-active proposal) ERR-PROPOSAL-CLOSED)
+        (map-set Proposals
+            { proposal-id: proposal-id }
+            (merge proposal { is-active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? Proposals { proposal-id: proposal-id })
+)
+
+(define-read-only (get-proposal-vote (proposal-id uint) (voter principal))
+    (map-get? ProposalVotes { proposal-id: proposal-id, voter: voter })
+)
+
+(define-read-only (get-proposal-status (proposal-id uint))
+    (let ((proposal (unwrap! (get-proposal proposal-id) (err "not-found"))))
+        (ok {
+            is-active: (get is-active proposal),
+            is-executed: (get is-executed proposal),
+            voting-ended: (>= stacks-block-height (get voting-deadline proposal)),
+            result: (if (> (get votes-for proposal) (get votes-against proposal)) "pass" "fail")
+        })
+    )
+)
 
 (define-map FundingRounds
     { startup-id: uint, round-id: uint }

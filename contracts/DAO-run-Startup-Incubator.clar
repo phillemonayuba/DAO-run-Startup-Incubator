@@ -561,3 +561,273 @@
 (define-read-only (get-startup-round-count (startup-id uint))
     (default-to { round-count: u0 } (map-get? StartupRoundCounts { startup-id: startup-id }))
 )
+
+(define-constant ERR-INVALID-SCORE (err u115))
+(define-constant ERR-INSUFFICIENT-DATA (err u116))
+
+(define-data-var performance-update-threshold uint u30)
+
+(define-map StartupPerformance
+    { startup-id: uint }
+    {
+        milestones-completed: uint,
+        milestones-overdue: uint,
+        total-funding-efficiency: uint,
+        mentor-satisfaction-score: uint,
+        investor-confidence-score: uint,
+        overall-performance-score: uint,
+        last-updated: uint,
+        performance-trend: (string-ascii 10)
+    }
+)
+
+(define-map PerformanceMetrics
+    { startup-id: uint, metric-type: (string-ascii 20) }
+    {
+        value: uint,
+        recorded-at: uint,
+        recorded-by: principal
+    }
+)
+
+(define-map StartupScoreHistory
+    { startup-id: uint, score-id: uint }
+    {
+        score: uint,
+        timestamp: uint,
+        factors: (string-ascii 200)
+    }
+)
+
+(define-map StartupScoreCounts
+    { startup-id: uint }
+    { score-count: uint }
+)
+
+(define-public (update-startup-performance (startup-id uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (current-performance (default-to 
+            {
+                milestones-completed: u0,
+                milestones-overdue: u0,
+                total-funding-efficiency: u0,
+                mentor-satisfaction-score: u50,
+                investor-confidence-score: u50,
+                overall-performance-score: u50,
+                last-updated: u0,
+                performance-trend: "stable"
+            }
+            (map-get? StartupPerformance { startup-id: startup-id }))))
+        (asserts! (or (is-eq tx-sender (get founder startup))
+                     (is-eq tx-sender (var-get dao-owner))
+                     (is-some (get-mentor tx-sender))) ERR-NOT-AUTHORIZED)
+        (let ((milestone-score (calculate-milestone-score startup-id))
+              (funding-score (calculate-funding-efficiency startup-id))
+              (overall-score (/ (+ milestone-score funding-score 
+                                 (get mentor-satisfaction-score current-performance)
+                                 (get investor-confidence-score current-performance)) u4)))
+            (map-set StartupPerformance
+                { startup-id: startup-id }
+                {
+                    milestones-completed: (get-completed-milestones-count startup-id),
+                    milestones-overdue: (get-overdue-milestones-count startup-id),
+                    total-funding-efficiency: funding-score,
+                    mentor-satisfaction-score: (get mentor-satisfaction-score current-performance),
+                    investor-confidence-score: (get investor-confidence-score current-performance),
+                    overall-performance-score: overall-score,
+                    last-updated: stacks-block-height,
+                    performance-trend: (determine-performance-trend overall-score 
+                                      (get overall-performance-score current-performance))
+                }
+            )
+            (record-score-history startup-id overall-score)
+            (ok overall-score)
+        )
+    )
+)
+
+(define-public (record-performance-metric 
+    (startup-id uint) 
+    (metric-type (string-ascii 20)) 
+    (value uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND)))
+        (asserts! (or (is-eq tx-sender (get founder startup))
+                     (is-eq tx-sender (var-get dao-owner))
+                     (is-some (get-mentor tx-sender))) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= value u0) (<= value u100)) ERR-INVALID-SCORE)
+        (map-set PerformanceMetrics
+            { startup-id: startup-id, metric-type: metric-type }
+            {
+                value: value,
+                recorded-at: stacks-block-height,
+                recorded-by: tx-sender
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-mentor-satisfaction (startup-id uint) (score uint))
+    (let ((assignment (unwrap! (get-startup-mentor startup-id) ERR-NOT-AUTHORIZED))
+          (current-performance (unwrap! (get-startup-performance startup-id) ERR-INSUFFICIENT-DATA)))
+        (asserts! (is-eq tx-sender (get assigned-mentor assignment)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= score u0) (<= score u100)) ERR-INVALID-SCORE)
+        (map-set StartupPerformance
+            { startup-id: startup-id }
+            (merge current-performance { mentor-satisfaction-score: score })
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-investor-confidence (startup-id uint) (score uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (current-performance (unwrap! (get-startup-performance startup-id) ERR-INSUFFICIENT-DATA)))
+        (asserts! (is-some (get-investment startup-id u0 tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= score u0) (<= score u100)) ERR-INVALID-SCORE)
+        (map-set StartupPerformance
+            { startup-id: startup-id }
+            (merge current-performance { investor-confidence-score: score })
+        )
+        (ok true)
+    )
+)
+
+(define-private (calculate-milestone-score (startup-id uint))
+    (let ((completed (get-completed-milestones-count startup-id))
+          (overdue (get-overdue-milestones-count startup-id))
+          (total (+ completed overdue)))
+        (if (is-eq total u0)
+            u50
+            (/ (* completed u100) total)
+        )
+    )
+)
+
+(define-private (calculate-funding-efficiency (startup-id uint))
+    (match (get-startup startup-id)
+        startup (let ((requested (get funding-requested startup))
+                     (received (get funding-received startup)))
+                    (if (is-eq requested u0)
+                        u50
+                        (let ((efficiency (/ (* received u100) requested)))
+                            (if (> efficiency u100) u100 efficiency)
+                        )
+                    )
+                )
+        u50
+    )
+)
+
+(define-private (get-completed-milestones-count (startup-id uint))
+    (match (get-startup startup-id)
+        startup (get count (fold count-completed-milestones 
+                           (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+                           { startup-id: startup-id, count: u0, total: (get milestone-count startup) }))
+        u0
+    )
+)
+
+(define-private (get-overdue-milestones-count (startup-id uint))
+    (match (get-startup startup-id)
+        startup (get count (fold count-overdue-milestones 
+                           (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+                           { startup-id: startup-id, count: u0, total: (get milestone-count startup) }))
+        u0
+    )
+)
+
+(define-private (count-completed-milestones (milestone-idx uint) (acc { startup-id: uint, count: uint, total: uint }))
+    (if (< milestone-idx (get total acc))
+        (let ((milestone (get-milestone (get startup-id acc) milestone-idx)))
+            (if (and (is-some milestone) (get completed (unwrap-panic milestone)))
+                (merge acc { count: (+ (get count acc) u1) })
+                acc
+            )
+        )
+        acc
+    )
+)
+
+(define-private (count-overdue-milestones (milestone-idx uint) (acc { startup-id: uint, count: uint, total: uint }))
+    (if (< milestone-idx (get total acc))
+        (let ((milestone (get-milestone (get startup-id acc) milestone-idx)))
+            (if (and (is-some milestone) 
+                    (not (get completed (unwrap-panic milestone)))
+                    (< (get target-date (unwrap-panic milestone)) stacks-block-height))
+                (merge acc { count: (+ (get count acc) u1) })
+                acc
+            )
+        )
+        acc
+    )
+)
+
+(define-private (determine-performance-trend (current-score uint) (previous-score uint))
+    (if (> current-score (+ previous-score u10))
+        "improving"
+        (if (< current-score (- previous-score u10))
+            "declining"
+            "stable"
+        )
+    )
+)
+
+(define-private (record-score-history (startup-id uint) (score uint))
+    (let ((score-count-data (default-to { score-count: u0 } 
+                           (map-get? StartupScoreCounts { startup-id: startup-id })))
+          (score-id (get score-count score-count-data)))
+        (map-set StartupScoreHistory
+            { startup-id: startup-id, score-id: score-id }
+            {
+                score: score,
+                timestamp: stacks-block-height,
+                factors: "milestone,funding,mentor,investor"
+            }
+        )
+        (map-set StartupScoreCounts
+            { startup-id: startup-id }
+            { score-count: (+ score-id u1) }
+        )
+    )
+)
+
+(define-read-only (get-startup-performance (startup-id uint))
+    (map-get? StartupPerformance { startup-id: startup-id })
+)
+
+(define-read-only (get-performance-metric (startup-id uint) (metric-type (string-ascii 20)))
+    (map-get? PerformanceMetrics { startup-id: startup-id, metric-type: metric-type })
+)
+
+(define-read-only (get-score-history (startup-id uint) (score-id uint))
+    (map-get? StartupScoreHistory { startup-id: startup-id, score-id: score-id })
+)
+
+(define-read-only (get-startup-rankings (min-score uint))
+    (ok {
+        threshold: min-score,
+        ranking-criteria: "overall-performance-score",
+        last-updated: stacks-block-height
+    })
+)
+
+(define-read-only (analyze-startup-performance (startup-id uint))
+    (let ((performance (unwrap! (get-startup-performance startup-id) (err "no-data")))
+          (startup (unwrap! (get-startup startup-id) (err "not-found"))))
+        (ok {
+            startup-name: (get name startup),
+            overall-score: (get overall-performance-score performance),
+            milestone-completion-rate: (let ((total-milestones (+ (get milestones-completed performance) 
+                                                  (get milestones-overdue performance))))
+                                        (if (is-eq total-milestones u0)
+                                            u0
+                                            (/ (* (get milestones-completed performance) u100) total-milestones))),
+            funding-efficiency: (get total-funding-efficiency performance),
+            performance-trend: (get performance-trend performance),
+            mentor-satisfaction: (get mentor-satisfaction-score performance),
+            investor-confidence: (get investor-confidence-score performance),
+            last-assessment: (get last-updated performance)
+        })
+    )
+)

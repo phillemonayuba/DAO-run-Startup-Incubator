@@ -564,6 +564,9 @@
 
 (define-constant ERR-INVALID-SCORE (err u115))
 (define-constant ERR-INSUFFICIENT-DATA (err u116))
+(define-constant ERR-BADGE-EXISTS (err u117))
+(define-constant ERR-BADGE-NOT-FOUND (err u118))
+(define-constant ERR-REQUIREMENT-NOT-MET (err u119))
 
 (define-data-var performance-update-threshold uint u30)
 
@@ -828,6 +831,272 @@
             mentor-satisfaction: (get mentor-satisfaction-score performance),
             investor-confidence: (get investor-confidence-score performance),
             last-assessment: (get last-updated performance)
+        })
+    )
+)
+
+(define-map StartupReputation
+    { startup-id: uint }
+    {
+        reputation-score: uint,
+        total-badges: uint,
+        tier: (string-ascii 20),
+        achievements-unlocked: uint,
+        last-tier-update: uint
+    }
+)
+
+(define-map StartupBadges
+    { startup-id: uint, badge-type: (string-ascii 30) }
+    {
+        earned-at: uint,
+        badge-level: uint,
+        is-active: bool
+    }
+)
+
+(define-map BadgeDefinitions
+    { badge-type: (string-ascii 30) }
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        requirement-type: (string-ascii 30),
+        requirement-value: uint,
+        reputation-points: uint,
+        max-level: uint
+    }
+)
+
+(define-data-var badge-types-initialized bool false)
+
+(define-public (initialize-badge-system)
+    (begin
+        (asserts! (not (var-get badge-types-initialized)) ERR-BADGE-EXISTS)
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-set BadgeDefinitions
+            { badge-type: "first-milestone" }
+            {
+                name: "Milestone Pioneer",
+                description: "Complete your first milestone",
+                requirement-type: "milestones-completed",
+                requirement-value: u1,
+                reputation-points: u50,
+                max-level: u1
+            }
+        )
+        (map-set BadgeDefinitions
+            { badge-type: "funding-champion" }
+            {
+                name: "Funding Champion",
+                description: "Reach 100% funding goal",
+                requirement-type: "funding-efficiency",
+                requirement-value: u100,
+                reputation-points: u100,
+                max-level: u3
+            }
+        )
+        (map-set BadgeDefinitions
+            { badge-type: "milestone-master" }
+            {
+                name: "Milestone Master",
+                description: "Complete 5 milestones",
+                requirement-type: "milestones-completed",
+                requirement-value: u5,
+                reputation-points: u150,
+                max-level: u5
+            }
+        )
+        (map-set BadgeDefinitions
+            { badge-type: "high-performer" }
+            {
+                name: "High Performer",
+                description: "Achieve performance score above 80",
+                requirement-type: "performance-score",
+                requirement-value: u80,
+                reputation-points: u200,
+                max-level: u3
+            }
+        )
+        (map-set BadgeDefinitions
+            { badge-type: "investor-favorite" }
+            {
+                name: "Investor Favorite",
+                description: "Attract 10 or more investors",
+                requirement-type: "investor-count",
+                requirement-value: u10,
+                reputation-points: u120,
+                max-level: u3
+            }
+        )
+        (var-set badge-types-initialized true)
+        (ok true)
+    )
+)
+
+(define-public (check-and-award-badges (startup-id uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (performance (get-startup-performance startup-id))
+          (current-reputation (default-to 
+            {
+                reputation-score: u0,
+                total-badges: u0,
+                tier: "bronze",
+                achievements-unlocked: u0,
+                last-tier-update: u0
+            }
+            (map-get? StartupReputation { startup-id: startup-id }))))
+        (asserts! (or (is-eq tx-sender (get founder startup))
+                     (is-eq tx-sender (var-get dao-owner))) ERR-NOT-AUTHORIZED)
+        (let ((badges-awarded (check-all-badge-requirements startup-id startup performance)))
+            (update-reputation-tier startup-id current-reputation)
+            (ok badges-awarded)
+        )
+    )
+)
+
+(define-private (check-all-badge-requirements 
+    (startup-id uint) 
+    (startup { founder: principal, name: (string-ascii 50), description: (string-ascii 500), 
+               funding-requested: uint, funding-received: uint, status: (string-ascii 20), 
+               votes: uint, milestone-count: uint })
+    (performance (optional { milestones-completed: uint, milestones-overdue: uint, 
+                            total-funding-efficiency: uint, mentor-satisfaction-score: uint, 
+                            investor-confidence-score: uint, overall-performance-score: uint, 
+                            last-updated: uint, performance-trend: (string-ascii 10) })))
+    (let ((perf-data (default-to 
+            { milestones-completed: u0, milestones-overdue: u0, total-funding-efficiency: u0, 
+              mentor-satisfaction-score: u0, investor-confidence-score: u0, 
+              overall-performance-score: u0, last-updated: u0, performance-trend: "stable" } 
+            performance))
+          (milestones-completed (get milestones-completed perf-data))
+          (funding-efficiency (get total-funding-efficiency perf-data))
+          (overall-score (get overall-performance-score perf-data)))
+        (begin
+            (if (>= milestones-completed u1)
+                (try! (award-badge startup-id "first-milestone" u1))
+                true
+            )
+            (if (>= funding-efficiency u100)
+                (try! (award-badge startup-id "funding-champion" u1))
+                true
+            )
+            (if (>= milestones-completed u5)
+                (try! (award-badge startup-id "milestone-master" u1))
+                true
+            )
+            (if (>= overall-score u80)
+                (try! (award-badge startup-id "high-performer" u1))
+                true
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (award-badge (startup-id uint) (badge-type (string-ascii 30)) (level uint))
+    (let ((existing-badge (map-get? StartupBadges { startup-id: startup-id, badge-type: badge-type }))
+          (badge-def (unwrap! (get-badge-definition badge-type) ERR-BADGE-NOT-FOUND))
+          (current-reputation (default-to 
+            {
+                reputation-score: u0,
+                total-badges: u0,
+                tier: "bronze",
+                achievements-unlocked: u0,
+                last-tier-update: u0
+            }
+            (map-get? StartupReputation { startup-id: startup-id }))))
+        (if (is-none existing-badge)
+            (begin
+                (map-set StartupBadges
+                    { startup-id: startup-id, badge-type: badge-type }
+                    {
+                        earned-at: stacks-block-height,
+                        badge-level: level,
+                        is-active: true
+                    }
+                )
+                (map-set StartupReputation
+                    { startup-id: startup-id }
+                    (merge current-reputation {
+                        reputation-score: (+ (get reputation-score current-reputation) 
+                                           (get reputation-points badge-def)),
+                        total-badges: (+ (get total-badges current-reputation) u1),
+                        achievements-unlocked: (+ (get achievements-unlocked current-reputation) u1)
+                    })
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-private (update-reputation-tier 
+    (startup-id uint) 
+    (reputation { reputation-score: uint, total-badges: uint, tier: (string-ascii 20), 
+                  achievements-unlocked: uint, last-tier-update: uint }))
+    (let ((score (get reputation-score reputation))
+          (new-tier (if (>= score u500)
+                        "platinum"
+                        (if (>= score u300)
+                            "gold"
+                            (if (>= score u150)
+                                "silver"
+                                "bronze")))))
+        (map-set StartupReputation
+            { startup-id: startup-id }
+            (merge reputation {
+                tier: new-tier,
+                last-tier-update: stacks-block-height
+            })
+        )
+    )
+)
+
+(define-public (revoke-badge (startup-id uint) (badge-type (string-ascii 30)))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (badge (unwrap! (get-startup-badge startup-id badge-type) ERR-BADGE-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (map-set StartupBadges
+            { startup-id: startup-id, badge-type: badge-type }
+            (merge badge { is-active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-startup-reputation (startup-id uint))
+    (map-get? StartupReputation { startup-id: startup-id })
+)
+
+(define-read-only (get-startup-badge (startup-id uint) (badge-type (string-ascii 30)))
+    (map-get? StartupBadges { startup-id: startup-id, badge-type: badge-type })
+)
+
+(define-read-only (get-badge-definition (badge-type (string-ascii 30)))
+    (map-get? BadgeDefinitions { badge-type: badge-type })
+)
+
+(define-read-only (get-startup-profile (startup-id uint))
+    (let ((startup (unwrap! (get-startup startup-id) (err "not-found")))
+          (reputation-data (default-to 
+                { reputation-score: u0, total-badges: u0, tier: "bronze", 
+                  achievements-unlocked: u0, last-tier-update: u0 } 
+                (get-startup-reputation startup-id)))
+          (performance-data (default-to 
+                { milestones-completed: u0, milestones-overdue: u0, total-funding-efficiency: u0, 
+                  mentor-satisfaction-score: u0, investor-confidence-score: u0, 
+                  overall-performance-score: u0, last-updated: u0, performance-trend: "stable" } 
+                (get-startup-performance startup-id))))
+        (ok {
+            name: (get name startup),
+            status: (get status startup),
+            reputation-tier: (get tier reputation-data),
+            reputation-score: (get reputation-score reputation-data),
+            total-badges: (get total-badges reputation-data),
+            performance-score: (get overall-performance-score performance-data),
+            funding-received: (get funding-received startup),
+            votes: (get votes startup)
         })
     )
 )

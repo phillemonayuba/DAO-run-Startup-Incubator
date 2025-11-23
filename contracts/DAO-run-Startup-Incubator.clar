@@ -1100,3 +1100,214 @@
         })
     )
 )
+
+(define-constant ERR-EXIT-EXISTS (err u120))
+(define-constant ERR-EXIT-NOT-FOUND (err u121))
+(define-constant ERR-EXIT-NOT-APPROVED (err u122))
+(define-constant ERR-ALREADY-DISTRIBUTED (err u123))
+(define-constant ERR-NO-INVESTMENT (err u124))
+
+(define-map StartupExits
+    { startup-id: uint }
+    {
+        exit-type: (string-ascii 20),
+        exit-valuation: uint,
+        exit-date: uint,
+        total-proceeds: uint,
+        is-approved: bool,
+        is-distributed: bool,
+        approved-by: (optional principal)
+    }
+)
+
+(define-map InvestorDistributions
+    { startup-id: uint, investor: principal }
+    {
+        total-invested: uint,
+        distribution-amount: uint,
+        return-multiple: uint,
+        claimed: bool,
+        claim-date: (optional uint)
+    }
+)
+
+(define-public (propose-exit (startup-id uint) (exit-type (string-ascii 20)) (valuation uint) (proceeds uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get founder startup)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (map-get? StartupExits { startup-id: startup-id })) ERR-EXIT-EXISTS)
+        (asserts! (> valuation u0) ERR-INVALID-AMOUNT)
+        (asserts! (> proceeds u0) ERR-INVALID-AMOUNT)
+        (map-set StartupExits
+            { startup-id: startup-id }
+            {
+                exit-type: exit-type,
+                exit-valuation: valuation,
+                exit-date: stacks-block-height,
+                total-proceeds: proceeds,
+                is-approved: false,
+                is-distributed: false,
+                approved-by: none
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-exit (startup-id uint))
+    (let ((exit-data (unwrap! (map-get? StartupExits { startup-id: startup-id }) ERR-EXIT-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get dao-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get is-approved exit-data)) ERR-EXIT-EXISTS)
+        (map-set StartupExits
+            { startup-id: startup-id }
+            (merge exit-data {
+                is-approved: true,
+                approved-by: (some tx-sender)
+            })
+        )
+        (map-set Startups
+            { id: startup-id }
+            (merge (unwrap-panic (get-startup startup-id)) { status: "exited" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (calculate-distributions (startup-id uint))
+    (let ((exit-data (unwrap! (map-get? StartupExits { startup-id: startup-id }) ERR-EXIT-NOT-FOUND))
+          (startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (round-count-data (get-startup-round-count startup-id))
+          (total-rounds (get round-count round-count-data)))
+        (asserts! (is-eq tx-sender (get founder startup)) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-approved exit-data) ERR-EXIT-NOT-APPROVED)
+        (asserts! (not (get is-distributed exit-data)) ERR-ALREADY-DISTRIBUTED)
+        (let ((total-raised (get funding-received startup)))
+            (asserts! (> total-raised u0) ERR-INSUFFICIENT-FUNDS)
+            (process-all-rounds startup-id total-rounds total-raised (get total-proceeds exit-data))
+            (map-set StartupExits
+                { startup-id: startup-id }
+                (merge exit-data { is-distributed: true })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-private (process-all-rounds (startup-id uint) (total-rounds uint) (total-raised uint) (total-proceeds uint))
+    (fold process-single-round
+        (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+        { startup-id: startup-id, max-rounds: total-rounds, total-raised: total-raised, 
+          total-proceeds: total-proceeds, success: true })
+)
+
+(define-private (process-single-round 
+    (round-idx uint) 
+    (acc { startup-id: uint, max-rounds: uint, total-raised: uint, total-proceeds: uint, success: bool }))
+    (if (and (get success acc) (< round-idx (get max-rounds acc)))
+        (let ((round-data (get-funding-round (get startup-id acc) round-idx)))
+            (match round-data
+                round (merge acc { success: true })
+                acc
+            )
+        )
+        acc
+    )
+)
+
+(define-public (claim-distribution (startup-id uint))
+    (let ((distribution (unwrap! (map-get? InvestorDistributions 
+                                  { startup-id: startup-id, investor: tx-sender }) 
+                                  ERR-NO-INVESTMENT))
+          (exit-data (unwrap! (map-get? StartupExits { startup-id: startup-id }) ERR-EXIT-NOT-FOUND)))
+        (asserts! (get is-distributed exit-data) ERR-EXIT-NOT-APPROVED)
+        (asserts! (not (get claimed distribution)) ERR-ALREADY-DISTRIBUTED)
+        (map-set InvestorDistributions
+            { startup-id: startup-id, investor: tx-sender }
+            (merge distribution {
+                claimed: true,
+                claim-date: (some stacks-block-height)
+            })
+        )
+        (ok (get distribution-amount distribution))
+    )
+)
+
+(define-public (record-investor-distribution 
+    (startup-id uint) 
+    (investor principal) 
+    (invested uint) 
+    (distribution uint))
+    (let ((startup (unwrap! (get-startup startup-id) ERR-STARTUP-NOT-FOUND))
+          (exit-data (unwrap! (map-get? StartupExits { startup-id: startup-id }) ERR-EXIT-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get founder startup)) ERR-NOT-AUTHORIZED)
+        (asserts! (get is-approved exit-data) ERR-EXIT-NOT-APPROVED)
+        (asserts! (> invested u0) ERR-INVALID-AMOUNT)
+        (let ((return-multiple (if (> invested u0) (/ (* distribution u100) invested) u0)))
+            (map-set InvestorDistributions
+                { startup-id: startup-id, investor: investor }
+                {
+                    total-invested: invested,
+                    distribution-amount: distribution,
+                    return-multiple: return-multiple,
+                    claimed: false,
+                    claim-date: none
+                }
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-exit-details (startup-id uint))
+    (map-get? StartupExits { startup-id: startup-id })
+)
+
+(define-read-only (get-investor-distribution (startup-id uint) (investor principal))
+    (map-get? InvestorDistributions { startup-id: startup-id, investor: investor })
+)
+
+(define-read-only (calculate-investor-returns (startup-id uint) (investor principal))
+    (let ((total-invested (calculate-total-investment startup-id investor))
+          (exit-data (map-get? StartupExits { startup-id: startup-id })))
+        (match exit-data
+            exit (if (and (get is-approved exit) (> total-invested u0))
+                    (let ((startup (unwrap! (get-startup startup-id) (err "not-found")))
+                          (total-raised (get funding-received startup))
+                          (investor-share (/ (* total-invested u10000) total-raised))
+                          (distribution (/ (* (get total-proceeds exit) investor-share) u10000))
+                          (return-multiple (/ (* distribution u100) total-invested)))
+                        (ok {
+                            invested: total-invested,
+                            projected-distribution: distribution,
+                            return-multiple: return-multiple,
+                            ownership-percentage: investor-share
+                        })
+                    )
+                    (err "insufficient-data")
+                )
+            (err "no-exit")
+        )
+    )
+)
+
+(define-private (calculate-total-investment (startup-id uint) (investor principal))
+    (let ((round-count-data (get-startup-round-count startup-id))
+          (total-rounds (get round-count round-count-data)))
+        (get total (fold sum-investments
+            (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+            { startup-id: startup-id, investor: investor, max-rounds: total-rounds, total: u0 }))
+    )
+)
+
+(define-private (sum-investments 
+    (round-idx uint) 
+    (acc { startup-id: uint, investor: principal, max-rounds: uint, total: uint }))
+    (if (< round-idx (get max-rounds acc))
+        (let ((investment (get-investment (get startup-id acc) round-idx (get investor acc))))
+            (match investment
+                inv (merge acc { total: (+ (get total acc) (get amount inv)) })
+                acc
+            )
+        )
+        acc
+    )
+)
